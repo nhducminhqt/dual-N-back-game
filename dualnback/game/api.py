@@ -4,6 +4,7 @@ from rest_framework import status
 from django.contrib.auth import get_user_model, authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.exceptions import ObjectDoesNotExist
+from utils import calculate_game_parameters
 User = get_user_model()  # <- Lấy CustomUser thay vì mặc định
 
 class RegisterView(APIView):
@@ -58,6 +59,65 @@ class CreateRoomView(APIView):
             "n_back": room.n_back,
             "delay": room.delay
         })
+
+from .models import SingleGameRoom
+class CreateSingleGameRoomView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # Lấy cấp độ từ request hoặc mặc định là 1
+        level = request.data.get("level", 1)
+        # Tính toán các tham số trò chơi dựa trên cấp độ
+        length, n_back, delay = calculate_game_parameters(level)
+        if level > request.user.highest_level +1:
+            return Response({
+                "error": "You cannot create a room with a level higher than your highest level."
+            }, status=400)
+        # Tạo phòng chơi đơn
+        room = SingleGameRoom.objects.create(
+            host=request.user,
+            level=level,
+            host_ready=False,
+            host_total_answered=0,
+            host_score=0
+        )
+
+        return Response({
+            "message": "Single game room created successfully",
+            "room_id": room.id,
+            "level": room.level,
+            "length": length,
+            "n_back": n_back,
+            "delay": delay,
+        }, status=201)
+class SingleGameReadyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        room_id = request.data.get("room_id")
+        try:
+            # Lấy phòng chơi đơn dựa trên ID và người dùng hiện tại
+            room = SingleGameRoom.objects.get(id=room_id, host=request.user)
+        except SingleGameRoom.DoesNotExist:
+            return Response({"error": "Room not found or you are not the host"}, status=404)
+
+        # Đặt trạng thái ready cho người chơi
+        room.host_ready = True
+        room.save()
+
+        # Gửi thông báo qua WebSocket để bắt đầu trò chơi
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f"single_game_{room.id}",
+            {
+                "type": "start_game",
+                "message": "Game is starting!"
+            }
+        )
+
+        return Response({"message": "Ready status set, game will start soon"})
 class ReadyView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -119,40 +179,6 @@ def count_correct_positions(sequence, n_back):
             count += 1
     return count
    
-# class GameResultView(APIView):
-#     permission_classes = [IsAuthenticated]
-
-#     def get(self, request, room_code):
-#         try:
-#             room = GameRoom.objects.get(room_code=room_code)
-#         except GameRoom.DoesNotExist:
-#             return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
-
-#         # Nếu winner chưa có → tự tính và cập nhật
-#         if room.host_score > room.guest_score:
-#             room.winner = room.host
-#         elif room.guest_score > room.host_score:
-#             room.winner = room.guest
-#         else:
-#             room.winner = None  # hòa
-#         room.save()
-
-#         host_percent = (
-#             room.host_score / room.host_total_answered * 100 if room.host_total_answered else 0
-#         )
-#         guest_percent = (
-#             room.guest_score / room.guest_total_answered * 100 if room.guest_total_answered else 0
-#         )
-
-#         return Response({
-#             "host_score": room.host_score,
-#             "guest_score": room.guest_score,
-#             "host_total_answered": room.host_total_answered,
-#             "guest_total_answered": room.guest_total_answered,
-#             "host_percent": round(host_percent, 2),
-#             "guest_percent": round(guest_percent, 2),
-#             "winner": room.winner.id if room.winner else "draw"
-#         })
 class GameResultView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -164,8 +190,8 @@ class GameResultView(APIView):
 
 
 
-        # ✅ Đếm tổng số bước đúng trong chuỗi
-        n_back = room.n_back  # hoặc room.difficulty nếu bạn có
+
+        n_back = room.n_back 
         sequence = room.sequence or []
         total_correct_in_sequence = count_correct_positions(sequence, n_back)
 
@@ -196,6 +222,50 @@ class GameResultView(APIView):
             "guest_percent": guest_f1,
             "winner": room.winner.id if room.winner else "draw"
         })
+class SingleGameResultView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, room_id):
+        try:
+            from .models import SingleGameRoom
+            room = SingleGameRoom.objects.get(id=room_id, host=request.user)
+        except SingleGameRoom.DoesNotExist:
+            return Response({"error": "Room not found or you are not the host"}, status=status.HTTP_404_NOT_FOUND)
+
+        n_back = room.level  
+        sequence = room.sequence or []
+        total_correct_in_sequence = count_correct_positions(sequence, n_back)
+
+        def compute_f1(correct, answered, total_needed):
+            precision = correct / answered if answered > 0 else 0
+            recall = correct / total_needed if total_needed > 0 else 0
+            if precision + recall == 0:
+                return 0
+            return round(2 * (precision * recall) / (precision + recall) * 100, 2)
+
+        # ✅ Tính F1 cho host
+        host_f1 = compute_f1(room.host_score, room.host_total_answered, total_correct_in_sequence)
+
+        user = request.user
+        if host_f1 >= 80:
+            if room.level == user.highest_level+1:
+                user.highest_level = room.level
+                user.f1_of_highest_level = host_f1
+                user.save()
+            elif room.level == user.highest_level:
+                room.level = user.highest_level and host_f1 > user.f1_of_highest_level
+                user.f1_of_highest_level = max(user.f1_of_highest_level, host_f1)
+                user.save()
+
+
+        return Response({
+            "host_score": room.host_score,
+            "host_total_answered": room.host_total_answered,
+            "total_correct_in_sequence": total_correct_in_sequence,
+            "host_percent": host_f1,
+            "highest_level": user.highest_level,
+            "f1_of_highest_level": user.f1_of_highest_level
+        })
 class GetRoomInfoView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -212,3 +282,18 @@ class GetRoomInfoView(APIView):
             "length": room.length,
             "delay": room.delay,
         }, status=200)
+class LeaderboardView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        users = User.objects.all().order_by('-highest_level', '-f1_of_highest_level')[:10]
+        leaderboard = [
+            {
+                "username": user.username,
+                "highest_level": user.highest_level,
+                "f1_of_highest_level": user.f1_of_highest_level,
+            }
+            for user in users
+        ]
+
+        return Response({"leaderboard": leaderboard}, status=200)
