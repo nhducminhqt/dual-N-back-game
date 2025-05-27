@@ -3,22 +3,9 @@ import ast
 import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-import random
+from utils import generate_dual_nback_sequence
 import string
-def generate_dual_nback_sequence(length, n_back):
-    if length <= n_back:
-        raise ValueError("length must be greater than n_back")
 
-    sequence = []
-    for _ in range(length):
-        position = [random.randint(0, 2), random.randint(0, 2)]
-        sequence.append({"position": position})
-
-    # Bắt buộc có ít nhất 1 cặp đúng tại vị trí i (i >= n_back)
-    i = random.randint(n_back, length - 1)
-    sequence[i]["position"] = sequence[i - n_back]["position"]
-
-    return sequence
 class GameConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         from django.contrib.auth.models import AnonymousUser
@@ -71,7 +58,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         return self.user.id == room.host_id
     @database_sync_to_async
     def join_room(self):
-        from ..models import GameRoom
+        from .models import GameRoom
 
         try:
             room = GameRoom.objects.get(room_code=self.room_code)
@@ -89,7 +76,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         return None
     @database_sync_to_async
     def update_score(self, position_match, correct):
-        from ..models import GameRoom
+        from .models import GameRoom
         room = GameRoom.objects.get(room_code=self.room_code)
 
         print(f"[UPDATE_SCORE] {self.user.username} - pos_match: {position_match}, correct: {correct}")
@@ -112,7 +99,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         return room.host.username, room.guest.username
     @database_sync_to_async
     def mark_user_ready(self):
-        from ..models import GameRoom
+        from .models import GameRoom
         room = GameRoom.objects.get(room_code=self.room_code)
 
         if self.user.id == room.host_id:
@@ -123,7 +110,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         room.save()
         return room.host_ready, room.guest_ready
     async def start_sequence(self, event):  
-        from ..models import GameRoom
+        from .models import GameRoom
         room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
         sequence = event["sequence"]
         for step, item in enumerate(sequence):
@@ -169,7 +156,7 @@ class GameConsumer(AsyncWebsocketConsumer):
             
 
     async def send_steps_to_group(self, sequence):
-        from ..models import GameRoom
+        from .models import GameRoom
         room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
         for step, item in enumerate(sequence):
             await self.channel_layer.group_send(
@@ -184,7 +171,7 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         await asyncio.sleep(2)  # đợi lượt cuối cùng
 
-        from ..models import GameRoom
+        from .models import GameRoom
         room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
         await asyncio.sleep(3)
         await database_sync_to_async(room.set_winner)()
@@ -208,7 +195,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
         await self.reset_room_state()
     async def start_game(self, event):
-        from ..models import GameRoom
+        from .models import GameRoom
         room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
         # host_username, guest_username = await self.get_usernames(room)
 
@@ -228,39 +215,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                     "sequence": sequence
                 }
             )
-            # for step, item in enumerate(sequence):
-            #     await self.channel_layer.group_send(
-            #         self.room_group_name,
-            #         {
-            #             "type": "send_step_to_clients",
-            #             "step": step,
-            #             "data": item
-            #         }
-            #     )
-            #     await asyncio.sleep(3)
 
-            # 👉 Sau khi gửi hết step
-            # await asyncio.sleep(3)  # Đợi phản hồi cuối
-            # room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
-            # await database_sync_to_async(room.set_winner)()
-
-            # host_percent = (
-            #     room.host_score / room.host_total_answered * 100 if room.host_total_answered > 0 else 0
-            # )
-            # guest_percent = (
-            #     room.guest_score / room.guest_total_answered * 100 if room.guest_total_answered > 0 else 0
-            # )
-
-            # await self.channel_layer.group_send(
-            #     self.room_group_name,
-            #     {
-            #         "type": "game_over",
-            #         "host_percent": round(host_percent, 2),
-            #         "guest_percent": round(guest_percent, 2),
-            #         "winner": room.winner.username if room.winner else "draw"
-            #     }
-            # )
-            # await self.reset_room_state() 
     async def send_step_to_clients(self, event):
         await self.send(text_data=json.dumps({
             "type": "step",
@@ -273,7 +228,7 @@ class GameConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data):
         data = json.loads(text_data)
         if data.get("type") == "ready":
-            from ..models import GameRoom
+            from .models import GameRoom
             room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
 
             # Đặt trạng thái ready
@@ -312,20 +267,11 @@ class GameConsumer(AsyncWebsocketConsumer):
             step = data.get("step")
             position_match = data.get("position_match", False)
 
-            from ..models import GameRoom
+            from .models import GameRoom
             room = await database_sync_to_async(GameRoom.objects.get)(room_code=self.room_code)
-            # sequence = room.sequence
-            # if isinstance(sequence, str):
-            #     try:
-            #         sequence = json.loads(sequence)
-            #     except Exception as e:
-            #         print(f"[ERROR] Failed to load sequence: {e}")
-            #         return
             sequence = room.sequence or []
-            n_back = room.n_back  # hoặc room.difficulty
-            # print(f"[DEBUG] Answer received for step {step}, sequence len = {len(sequence)}")
-            # print(f"[DEBUG] sequence = {sequence}")
-            # ✅ Kiểm tra giới hạn để tránh IndexError
+            n_back = room.n_back  
+    
             if not isinstance(sequence, list) or step is None or step >= len(sequence) or step < n_back:
                 print(f"[WARNING] Invalid step received: {step} (len: {len(sequence)})")
                 return
@@ -358,7 +304,7 @@ class GameConsumer(AsyncWebsocketConsumer):
      
     @database_sync_to_async
     def reset_room_state(self):
-        from ..models import GameRoom
+        from .models import GameRoom
         room = GameRoom.objects.get(room_code=self.room_code)
         room.host_ready = False
         room.guest_ready = False
@@ -371,7 +317,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         room.save()     
     @database_sync_to_async
     def leave_room(self):
-        from ..models import GameRoom
+        from .models import GameRoom
         try:
             room = GameRoom.objects.get(room_code=self.room_code)
 
